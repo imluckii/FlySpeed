@@ -1,0 +1,8 @@
+--- # Poggit-CI Manifest. Open the CI at https://poggit.pmmp.io/ci/imluckii/FlySpeed
+build-by-default: true
+branches:
+- master
+projects:
+  FlySpeed:
+    path: ""
+...
