@@ -1,0 +1,139 @@
+name: Build & Release PHAR
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  release:
+    types:
+      - published
+      - edited
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          tools: composer
+          ini-values: phar.readonly=0
+
+      - name: Read plugin metadata
+        id: plugin
+        run: |
+          set -euo pipefail
+          metadata="$(php build-plugin.php --metadata)"
+          if [ -z "$metadata" ]; then
+            echo "Failed to read plugin metadata from build-plugin.php" >&2
+            exit 1
+          fi
+          printf '%s' "$metadata" | php -r '
+          try {
+              $metadata = json_decode(stream_get_contents(STDIN), true, 512, JSON_THROW_ON_ERROR);
+              foreach ($metadata as $key => $value) {
+                  $value = (string) ($value ?? "");
+                  $delimiter = "__OUTPUT_" . md5($key . $value) . "__";
+                  echo $key . "<<" . $delimiter . PHP_EOL;
+                  echo $value . PHP_EOL;
+                  echo $delimiter . PHP_EOL;
+              }
+          } catch (Throwable $exception) {
+              fwrite(STDERR, "Failed to decode plugin metadata: " . $exception->getMessage() . PHP_EOL);
+              exit(1);
+          }
+          ' >> "$GITHUB_OUTPUT"
+
+      - name: Install Composer dependencies when available
+        if: hashFiles('composer.json') != ''
+        run: composer install --no-dev --no-interaction --no-progress --prefer-dist --optimize-autoloader
+
+      - name: Build PHAR
+        run: php build-plugin.php
+
+      - name: Upload PHAR build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.plugin.outputs.pharName }}-${{ github.sha }}
+          path: ${{ steps.plugin.outputs.pharPath }}
+
+      - name: Determine release action
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          RELEASE_EVENT_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ steps.plugin.outputs.releaseTag }}
+          PLUGIN_VERSION: ${{ steps.plugin.outputs.normalizedVersion }}
+        run: |
+          mode="skip"
+          target_tag=""
+          has_commit_flag() {
+            printf '%s\n' "$COMMIT_MESSAGE" | grep -Eq "(^|[[:space:]])$1($|[[:space:]])"
+          }
+
+          case "$EVENT_NAME" in
+            release)
+              if [ "${RELEASE_EVENT_TAG#v}" = "$PLUGIN_VERSION" ]; then
+                mode="upload"
+                target_tag="$RELEASE_EVENT_TAG"
+              fi
+              ;;
+            push)
+              if [ "$REF_TYPE" = "tag" ]; then
+                if [ "${REF_NAME#v}" = "$PLUGIN_VERSION" ]; then
+                  mode="create-or-update"
+                  target_tag="$REF_NAME"
+                fi
+              else
+                if has_commit_flag '--release'; then
+                  mode="create-or-update"
+                  target_tag="$RELEASE_TAG"
+                elif has_commit_flag '--update'; then
+                  mode="update"
+                  target_tag="$RELEASE_TAG"
+                fi
+              fi
+              ;;
+          esac
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "target_tag=$target_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish PHAR to GitHub Release
+        if: steps.release.outputs.mode != 'skip'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.release.outputs.mode }}
+          TARGET_TAG: ${{ steps.release.outputs.target_tag }}
+          PHAR_FILE: ${{ steps.plugin.outputs.pharPath }}
+          PLUGIN_VERSION: ${{ steps.plugin.outputs.normalizedVersion }}
+        run: |
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            gh release upload "$TARGET_TAG" "$PHAR_FILE" --clobber
+            exit 0
+          fi
+
+          if [ "$MODE" = "upload" ] || [ "$MODE" = "update" ]; then
+            echo "Matching release $TARGET_TAG not found, skipping upload."
+            exit 0
+          fi
+
+          gh release create "$TARGET_TAG" "$PHAR_FILE" \
+            --target "$GITHUB_SHA" \
+            --title "$TARGET_TAG" \
+            --notes "Automated release for version $PLUGIN_VERSION"
