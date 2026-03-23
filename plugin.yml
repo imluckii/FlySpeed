@@ -1,6 +1,6 @@
 name: FlySpeed
 main: imlucky\FlySpeed\FlySpeed
-version: 1.0.0
+version: 1.0
 api: 5.0.0
 author: imlucky
 description: A simple plugin that allows players to change their fly speed.
